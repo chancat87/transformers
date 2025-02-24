@@ -31,8 +31,12 @@ if is_torch_available():
     import torch
 
 if is_torchao_available():
-    from torchao.dtypes import AffineQuantizedTensor
-    from torchao.dtypes.affine_quantized_tensor import TensorCoreTiledLayoutType
+    # renamed in torchao 0.7.0, please install the latest torchao
+    from torchao.dtypes import (
+        AffineQuantizedTensor,
+        TensorCoreTiledLayout,
+    )
+    from torchao.quantization.autoquant import AQMixin
 
 
 def check_torchao_quantized(test_module, qlayer, batch_size=1, context_size=1024):
@@ -40,7 +44,12 @@ def check_torchao_quantized(test_module, qlayer, batch_size=1, context_size=1024
     test_module.assertTrue(isinstance(weight, AffineQuantizedTensor))
     test_module.assertEqual(weight.quant_min, 0)
     test_module.assertEqual(weight.quant_max, 15)
-    test_module.assertTrue(isinstance(weight.layout_type, TensorCoreTiledLayoutType))
+    test_module.assertTrue(isinstance(weight._layout, TensorCoreTiledLayout))
+
+
+def check_autoquantized(test_module, qlayer):
+    weight = qlayer.weight
+    test_module.assertTrue(isinstance(weight, AQMixin))
 
 
 def check_forward(test_module, model, batch_size=1, context_size=1024):
@@ -81,6 +90,16 @@ class TorchAoConfigTest(unittest.TestCase):
         """
         quantization_config = TorchAoConfig("int4_weight_only", modules_to_not_convert=["conv"], group_size=8)
         repr(quantization_config)
+
+    def test_json_serializable(self):
+        """
+        Check that the config dict can be JSON serialized.
+        """
+        quantization_config = TorchAoConfig("int4_weight_only", group_size=32, layout=TensorCoreTiledLayout())
+        d = quantization_config.to_dict()
+        self.assertIsInstance(d["quant_type_kwargs"]["layout"], dict)
+        self.assertTrue("inner_k_tiles" in d["quant_type_kwargs"]["layout"])
+        quantization_config.to_json_string(use_diff=False)
 
 
 @require_torch_gpu
@@ -234,6 +253,33 @@ class TorchAoTest(unittest.TestCase):
 
         output = quantized_model.generate(**input_ids, max_new_tokens=self.max_new_tokens)
         EXPECTED_OUTPUT = "What are we having for dinner?\n\nJessica: (smiling)"
+        self.assertEqual(tokenizer.decode(output[0], skip_special_tokens=True), EXPECTED_OUTPUT)
+
+    def test_autoquant(self):
+        """
+        Simple LLM model testing autoquant
+        """
+        quant_config = TorchAoConfig("autoquant")
+
+        quantized_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=torch_device,
+            quantization_config=quant_config,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        input_ids = tokenizer(self.input_text, return_tensors="pt").to(torch_device)
+        output = quantized_model.generate(
+            **input_ids, max_new_tokens=self.max_new_tokens, cache_implementation="static"
+        )
+        quantized_model.finalize_autoquant()
+
+        check_autoquantized(self, quantized_model.model.layers[0].self_attn.v_proj)
+
+        EXPECTED_OUTPUT = 'What are we having for dinner?\n\n10. "Dinner is ready'
+        output = quantized_model.generate(
+            **input_ids, max_new_tokens=self.max_new_tokens, cache_implementation="static"
+        )
         self.assertEqual(tokenizer.decode(output[0], skip_special_tokens=True), EXPECTED_OUTPUT)
 
 
